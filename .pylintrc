@@ -1,0 +1,6 @@
+[MESSAGES CONTROL]
+disable=R,C,broad-except
+ignored-classes=M3U8
+
+[REPORTS]
+score=no

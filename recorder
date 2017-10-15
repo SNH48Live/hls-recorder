@@ -1,0 +1,349 @@
+#!/usr/bin/env python3
+
+# TODO: optionally merge downloaded segments.
+
+import argparse
+import datetime
+import logging
+import multiprocessing
+import os
+import pathlib
+import queue
+import signal
+import sys
+import time
+import urllib.parse
+
+import eventlet
+import m3u8 as m3u8_parser
+import requests
+
+
+HERE = pathlib.Path(__file__).resolve().parent
+STREAM_URL = 'http://hlthls.48.cn/chaoqing/9999/playlist.m3u8'
+
+eventlet.monkey_patch(socket=True)
+logger = logging.getLogger(os.path.basename(__file__))
+logger.setLevel(logging.INFO)
+
+POLLING_INTERVAL = 1  # M3U8 polling interval
+M3U8_TIMEOUT = 3  # Timeout on M3U8 requests
+M3U8_MAX_RETRIES = 8  # Exponential backoff: 1s, 2s, 4s, ...
+MAX_RETRY_INTERVAL = 60  # Upper bound on exponential backoff
+
+POOL_SIZE = 6  # Size of worker pool
+SEGMENT_TIMEOUT = 15  # Timeout on segment downloads
+SEGMENT_MAX_RETRIES = 4  # Again, exponential backoff
+CHUNK_SIZE = 65536  # Download chunk size (64K)
+
+NoResponse = object()
+
+CHINA_STANDARD_TIME = datetime.timezone(datetime.timedelta(hours=8))  # UTC+08:00
+
+
+def excname(value):
+    etype = type(value)
+    if etype.__module__ == 'builtins':
+        return etype.__name__
+    else:
+        return '%s.%s' % (etype.__module__, etype.__name__)
+
+
+class HLSM3U8Error(RuntimeError):
+    pass
+
+
+class HLSM3U8(object):
+    """
+    HLS M3U8 processor.
+
+    Apparently, only a subset of HLS is implemented.
+
+    Usage:
+
+        with HLSM3U8('http://127.0.0.1:8080/hls.m3u8', 'test.txt') as m3u8:
+            for segment_url in m3u8:
+                # Process a segment URL. Processing should return
+                # immediately in order to not block polling;
+                # long-running task should be offloaded to a task queue.
+                print(segment_url)
+
+    """
+
+    # TODO: Maybe move polling off to another thread so that yielding
+    # and processing are independent from polling and updates. We
+    # already have a queue that's thread-safe.
+
+    def __init__(self, m3u8_url, record_path):
+        self.m3u8_url = m3u8_url
+        self.segments = []  # List of segment URLs
+        self.segment_indices = {}  # Mapping from segment URLs to indices, used for validation
+        self.last_index = None  # Index of the last segment (None when we have no segments yet)
+
+        self.record_path = record_path
+        if record_path.is_file():
+            with open(record_path) as fp:
+                for line in fp:
+                    index, segment = line.split()
+                    self.segments.append(segment)
+                    self.segment_indices[segment] = index
+                    self.last_index = int(index)
+
+        self.record = None  # Record file object, opened on __enter__, closed on __exit__
+        self.last_check = 0  # Time of last check
+        self.retries = 0  # Number of retries so far (in case of non-200 status code)
+        self.queue = queue.Queue()  # Queued segment URLs yet to be yielded
+        self.exhausted = False  # Whether the M3U8 has been exhausted
+                                # (EXT-X-ENDLIST or reached maxium number of retries with 404)  # noqa
+
+    def __enter__(self):
+        self.record = open(self.record_path, 'a')
+        return self
+
+    def __exit__(self, etype, value, tb):
+        if self.record is not None:
+            self.record.close()
+
+    def __iter__(self):
+        return self
+
+    # Do NOT run blocking operations between subsequent calls.
+    # Long-running tasks should be offloaded to a task queue.
+    def __next__(self):
+        while self.queue.empty():
+            if self.exhausted:
+                # Both the stream and the yielding queue are exhausted.
+                raise StopIteration
+
+            next_check = self.last_check + POLLING_INTERVAL
+            now = time.time()
+            if now < next_check:
+                time.sleep(next_check - now)
+            self.check()
+
+        return self.queue.get()
+
+    def check(self):
+        m3u8_url = self.m3u8_url
+        self.last_check = time.time()
+        try:
+            r = eventlet.with_timeout(M3U8_TIMEOUT, requests.get, m3u8_url,
+                                      timeout_value=NoResponse)
+            if r is NoResponse:
+                logger.error('GET %s: timeout after %d seconds', m3u8_url, M3U8_TIMEOUT)
+                # Do not do exponential backoff for a timeout, and do
+                # not count it as a retry.
+                return
+        except (OSError, requests.RequestException) as e:
+            logger.error('GET %s: %s: %s', m3u8_url, excname(e), e)
+            r = NoResponse
+
+        # Handle successful request
+        if r is not NoResponse and r.status_code == 200:
+            try:
+                m3u8_obj = m3u8_parser.M3U8(content=r.text)
+            except Exception as e:
+                logger.error('Failed to parse m3u8 file: %s: %s\n%s', excname(e), e, r.text)
+            else:
+                # Reset retries counter
+                self.retries = 0
+
+                if m3u8_obj.is_endlist:
+                    logger.info('Got EXT-X-ENDLIST')
+                    self.exhausted = True
+
+                leading_index = m3u8_obj.media_sequence
+                count = len(m3u8_obj.segments)
+                indices = range(leading_index, leading_index + count)
+                for index, segment_obj in zip(indices, m3u8_obj.segments):
+                    url = urllib.parse.urljoin(m3u8_url, segment_obj.uri)
+                    if url not in self.segment_indices:
+                        self.insert_segment(index, url)
+                # Return early on valid M3U8 file
+                return
+
+        # Handle error responses
+        if r is not NoResponse:
+            if r.status_code == 404:
+                # 404 could indicate the end of the livestream.
+                logger.warning('GET %s: HTTP 404', m3u8_url)
+                if self.retries == M3U8_MAX_RETRIES:
+                    # Assume the livestream has ended after a number of
+                    # retries that culminate in a 404.
+                    logger.info('Got 404 after maximum retries; assuming livestream has ended.')
+                    self.exhausted = True
+                    return
+            else:
+                logger.error('GET %s: HTTP %d', m3u8_url, r.status_code)
+
+        # Abort or handle exponential backoff
+        if self.retries == M3U8_MAX_RETRIES:
+            raise HLSM3U8Error
+        wait_time = min(2 ** self.retries, MAX_RETRY_INTERVAL)
+        logger.warning('Sleeping for %d seconds', wait_time)
+        time.sleep(wait_time)
+        self.retries += 1
+
+    def insert_segment(self, index, url):
+        if self.last_index is not None and index != self.last_index + 1:
+            logger.error('Bogus index for %s: %d after %d', url, index, self.last_index)
+
+        self.queue.put(url)
+        self.segments.append(url)
+        self.segment_indices[url] = index
+        self.last_index = index
+        print(index, url, file=self.record)
+        self.record.flush()
+
+
+def resumable_download(url, file):
+    existing_bytes = file.stat().st_size if file.is_file() else 0
+    try:
+        with eventlet.Timeout(SEGMENT_TIMEOUT):
+            r = requests.get(url, headers={'Range': 'bytes=%d-' % existing_bytes}, stream=True)
+        if r.status_code not in {200, 206}:
+            logger.error('GET %s: HTTP %d', url, r.status_code)
+            return False
+
+        with open(file, 'ab') as fp:
+            for chunk in r.iter_content(chunk_size=CHUNK_SIZE):
+                if chunk:
+                    fp.write(chunk)
+    except eventlet.Timeout:
+        logger.error('GET %s: timeout after %d seconds', url, SEGMENT_TIMEOUT)
+        return False
+    except Exception as e:
+        logger.error('GET %s: %s: %s', url, excname(e), e)
+        return False
+    else:
+        return True
+
+
+def download_segment(url, directory):
+    retries = 0
+    while True:
+        if resumable_download(url, directory / os.path.basename(url)):
+            return True
+
+        if retries == SEGMENT_MAX_RETRIES:
+            return False
+
+        wait_time = min(2 ** retries, MAX_RETRY_INTERVAL)
+        logger.warning('GET %s: sleeping for %d seconds', url, wait_time)
+        time.sleep(wait_time)
+        retries += 1
+
+
+# futures: List[multiprocessing.pool.AsyncResult]
+def inspect_futures(futures):
+    pending = []
+    completed = []
+    failed = []
+    for future in futures:
+        if future.ready():
+            if future.get():
+                completed.append(future)
+            else:
+                failed.append(future)
+        else:
+            pending.append(future)
+    return pending, completed, failed
+
+
+def hls_download(m3u8_url, directory):
+    directory.mkdir(parents=True, exist_ok=True)
+    logger.info('Recording into "%s"', directory)
+
+    def worker_init():
+        # Ignore SIGINT in worker processes to disable traceback from
+        # each worker on keyboard interrupt.
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+    with multiprocessing.Pool(POOL_SIZE, worker_init) as pool:
+        count = 0
+        complete_count = 0
+        fail_count = 0
+        futures = []
+
+        with HLSM3U8(m3u8_url, directory / 'record.txt') as m3u8:
+            for segment_url in m3u8:
+                count += 1
+                futures.append(pool.apply_async(download_segment, (segment_url, directory)))
+                logger.info('Queued %s', segment_url)
+
+                futures, completed, failed = inspect_futures(futures)
+                complete_count += len(completed)
+                fail_count += len(failed)
+                logger.info('Downloaded: %d/%d segments', complete_count, count)
+
+        pool.close()
+
+        while futures:
+            time.sleep(5)
+
+            futures, completed, failed = inspect_futures(futures)
+            complete_count += len(completed)
+            fail_count += len(failed)
+            logger.info('Downloaded: %d/%d segments', complete_count, count)
+
+        pool.join()
+
+        logger.info('Download complete')
+        if fail_count:
+            logger.error('Failed to download %s segments', fail_count)
+
+        return fail_count == 0
+
+
+def main():
+    description = ('Record an HLS stream (record segment URLs and download the segments). '
+                   'When this recorder is initiated, the assumption is that the stream is '
+                   'already ongoing. The recorder stops when EXT-X-ENDLIST is detected, or '
+                   'when the M3U8 URL returns 404 after a number of retries.')
+    parser = argparse.ArgumentParser(description=description)
+    add = parser.add_argument
+    add('-u', '--url', default=STREAM_URL,
+        help='M3U8 stream URL; default is the "chaoqing" stream on live.snh48.com')
+    add('-d', '--dest', metavar='DIRECTORY',
+        help='destination directory; default is named after the starting datetime in CST')
+    args = parser.parse_args()
+
+    m3u8_url = args.url
+    if args.dest:
+        directory = pathlib.Path(args.dest)
+    else:
+        now = datetime.datetime.now(tz=CHINA_STANDARD_TIME)
+        directory = HERE / now.strftime('%Y-%m-%d %H.%M.%S')
+    directory.mkdir(parents=True, exist_ok=True)
+
+    # Install logging handlers
+    fmt = logging.Formatter(fmt='%(asctime)s [%(levelname)s] %(message)s',
+                            datefmt='%Y-%m-%dT%H:%M:%S')
+    sh = logging.StreamHandler()
+    sh.setFormatter(fmt)
+    sh.setLevel(logging.INFO)
+    logger.addHandler(sh)
+
+    logpath = directory / 'errors.log'
+    fh = logging.FileHandler(logpath)
+    fh.setFormatter(fmt)
+    fh.setLevel(logging.WARNING)
+    logger.addHandler(fh)
+
+    logger.info('Logging errors and warnings to "%s"', logpath)
+
+    try:
+        success = hls_download(m3u8_url, directory)
+        sys.exit(0 if success else 1)
+    except KeyboardInterrupt:
+        logger.critical('%s: recording interrupted', m3u8_url)
+        sys.exit(1)
+    except HLSM3U8Error:
+        logger.critical('%s: failed to download or process after a number of retries', m3u8_url)
+        sys.exit(1)
+    except Exception as e:
+        logger.critical('%s: recording aborted due to uncaught %s: %s', m3u8_url, excname(e), e)
+
+
+if __name__ == '__main__':
+    main()
