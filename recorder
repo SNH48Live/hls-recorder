@@ -130,12 +130,12 @@ class HLSM3U8(object):
             r = eventlet.with_timeout(M3U8_TIMEOUT, requests.get, m3u8_url,
                                       timeout_value=NoResponse)
             if r is NoResponse:
-                logger.error('GET %s: timeout after %d seconds', m3u8_url, M3U8_TIMEOUT)
+                logger.warning('GET %s: timeout after %d seconds', m3u8_url, M3U8_TIMEOUT)
                 # Do not do exponential backoff for a timeout, and do
                 # not count it as a retry.
                 return
         except (OSError, requests.RequestException) as e:
-            logger.error('GET %s: %s: %s', m3u8_url, excname(e), e)
+            logger.warning('GET %s: %s: %s', m3u8_url, excname(e), e)
             r = NoResponse
 
         # Handle successful request
@@ -210,10 +210,10 @@ def resumable_download(url, file):
                 if chunk:
                     fp.write(chunk)
     except eventlet.Timeout:
-        logger.error('GET %s: timeout after %d seconds', url, SEGMENT_TIMEOUT)
+        logger.warning('GET %s: timeout after %d seconds', url, SEGMENT_TIMEOUT)
         return False
     except Exception as e:
-        logger.error('GET %s: %s: %s', url, excname(e), e)
+        logger.warning('GET %s: %s: %s', url, excname(e), e)
         return False
     else:
         return True
@@ -226,6 +226,7 @@ def download_segment(url, directory):
             return True
 
         if retries == SEGMENT_MAX_RETRIES:
+            logger.error('GET %s: failed after maximum number of retries', url)
             return False
 
         wait_time = min(2 ** retries, MAX_RETRY_INTERVAL)
