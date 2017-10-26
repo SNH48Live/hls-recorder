@@ -328,7 +328,7 @@ def main():
     logpath = directory / 'errors.log'
     fh = logging.FileHandler(logpath)
     fh.setFormatter(fmt)
-    fh.setLevel(logging.WARNING)
+    fh.setLevel(logging.ERROR)
     logger.addHandler(fh)
 
     logger.info('Logging errors and warnings to "%s"', logpath)
