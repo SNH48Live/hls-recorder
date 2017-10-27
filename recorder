@@ -251,14 +251,15 @@ def inspect_futures(futures):
     return pending, completed, failed
 
 
+def worker_init():
+    # Ignore SIGINT in worker processes to disable traceback from
+    # each worker on keyboard interrupt.
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+
 def hls_download(m3u8_url, directory):
     directory.mkdir(parents=True, exist_ok=True)
     logger.info('Recording into "%s"', directory)
-
-    def worker_init():
-        # Ignore SIGINT in worker processes to disable traceback from
-        # each worker on keyboard interrupt.
-        signal.signal(signal.SIGINT, signal.SIG_IGN)
 
     with multiprocessing.Pool(POOL_SIZE, worker_init) as pool:
         count = 0
