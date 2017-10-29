@@ -27,7 +27,7 @@ logger = logging.getLogger(os.path.basename(__file__))
 logger.setLevel(logging.INFO)
 
 POLLING_INTERVAL = 1  # M3U8 polling interval
-M3U8_TIMEOUT = 3  # Timeout on M3U8 requests
+M3U8_TIMEOUT = 5  # Timeout on M3U8 requests
 M3U8_MAX_RETRIES = 8  # Exponential backoff: 1s, 2s, 4s, ...
 MAX_RETRY_INTERVAL = 60  # Upper bound on exponential backoff
 
