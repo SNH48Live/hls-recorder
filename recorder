@@ -12,6 +12,7 @@ import queue
 import signal
 import sys
 import time
+import traceback
 import urllib.parse
 
 import eventlet
@@ -308,6 +309,7 @@ def main():
         help='M3U8 stream URL; default is the "chaoqing" stream on live.snh48.com')
     add('-d', '--dest', metavar='DIRECTORY',
         help='destination directory; default is named after the starting datetime in CST')
+    add('--debug', action='store_true')
     args = parser.parse_args()
 
     m3u8_url = args.url
@@ -345,6 +347,8 @@ def main():
         sys.exit(1)
     except Exception as e:
         logger.critical('%s: recording aborted due to uncaught %s: %s', m3u8_url, excname(e), e)
+        if args.debug:
+            traceback.print_exc()
 
 
 if __name__ == '__main__':
