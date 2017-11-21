@@ -5,11 +5,13 @@
 import argparse
 import datetime
 import logging
+import math
 import multiprocessing
 import os
 import pathlib
 import queue
 import signal
+import subprocess
 import sys
 import time
 import traceback
@@ -78,16 +80,18 @@ class HLSM3U8(object):
     def __init__(self, m3u8_url, record_path):
         self.m3u8_url = m3u8_url
         self.segments = []  # List of segment URLs
-        self.segment_indices = {}  # Mapping from segment URLs to indices, used for validation
+        self.segment_indices = {}  # Mapping from segment URLs to indices
+        self.segment_durations = {}  # Mapping from segment URLs to durations
         self.last_index = None  # Index of the last segment (None when we have no segments yet)
 
         self.record_path = record_path
         if record_path.is_file():
             with open(record_path) as fp:
                 for line in fp:
-                    index, segment = line.split()
+                    index, segment, duration = line.split()
                     self.segments.append(segment)
                     self.segment_indices[segment] = index
+                    self.segment_durations[segment] = duration
                     self.last_index = int(index)
 
         self.record = None  # Record file object, opened on __enter__, closed on __exit__
@@ -158,8 +162,9 @@ class HLSM3U8(object):
                 indices = range(leading_index, leading_index + count)
                 for index, segment_obj in zip(indices, m3u8_obj.segments):
                     url = urllib.parse.urljoin(m3u8_url, segment_obj.uri)
+                    duration = segment_obj.duration
                     if url not in self.segment_indices:
-                        self.insert_segment(index, url)
+                        self.insert_segment(index, url, duration)
                 # Return early on valid M3U8 file
                 return
 
@@ -185,15 +190,16 @@ class HLSM3U8(object):
         time.sleep(wait_time)
         self.retries += 1
 
-    def insert_segment(self, index, url):
+    def insert_segment(self, index, url, duration):
         if self.last_index is not None and index != self.last_index + 1:
             logger.error('Bogus index for %s: %d after %d', url, index, self.last_index)
 
         self.queue.put(url)
         self.segments.append(url)
         self.segment_indices[url] = index
+        self.segment_durations[url] = duration
         self.last_index = index
-        print(index, url, file=self.record)
+        print(index, url, f'{duration:.6f}', file=self.record)
         self.record.flush()
 
 
@@ -296,6 +302,63 @@ def hls_download(m3u8_url, directory):
             logger.error('Failed to download %s segments', fail_count)
 
         return fail_count == 0
+
+
+# playlist is a list of (url, duration), output is an os.PathLike.
+def gen_local_m3u8(playlist, output, media_sequence=0, prefix=''):
+    logger.info(f'Writing {output} with {len(playlist)} segments')
+    target_duration = math.ceil(max(duration for _, duration in playlist))
+    with open(output, 'w') as fp:
+        print('#EXTM3U', file=fp)
+        print('#EXT-X-VERSION:3', file=fp)
+        print('#EXT-X-PLAYLIST-TYPE:VOD', file=fp)
+        print(f'#EXT-X-TARGETDURATION:{target_duration}', file=fp)
+        print(f'#EXT-X-MEDIA-SEQUENCE:{media_sequence}', file=fp)
+        for url, duration in playlist:
+            print(f'#EXTINF:{duration:.6f},', file=fp)
+            print(os.path.join(prefix, os.path.basename(url)), file=fp)
+        print('#EXT-X-ENDLIST', file=fp)
+
+
+def merge(directory):
+    intermediate_dir = directory / 'intermediate'
+    intermediate_dir.mkdir(exist_ok=True)
+
+    with open(directory / 'record.txt') as record:
+        playlist_index = 0
+
+        index, url, duration = record.readline().split()
+        index = int(index)
+        duration = float(duration)
+        media_sequence = index
+        last_index = index
+        playlist = [(url, duration)]
+
+        for line in record:
+            index, url, duration = line.split()
+            index = int(index)
+            duration = float(duration)
+            if index == last_index + 1:
+                playlist.append((url, duration))
+            else:
+                gen_local_m3u8(playlist, intermediate_dir / f'{playlist_index}.m3u8',
+                               media_sequence=media_sequence, prefix='..')
+                media_sequence = index
+                playlist = [(url, duration)]
+                playlist_index += 1
+            last_index = index
+
+        gen_local_m3u8(playlist, intermediate_dir / f'{playlist_index}.m3u8',
+                       media_sequence=media_sequence, prefix='..')
+
+    num_playlists = playlist_index + 1
+    for playlist_index in range(num_playlists):
+        m3u8_path = intermediate_dir / f'{playlist_index}.m3u8'
+        part = intermediate_dir / f'{playlist_index}.mp4'
+        logger.info(f'Merging {m3u8_path} into {part}')
+        cmd = ['ffmpeg', '-y', '-f', 'hls', '-i', m3u8_path,
+               '-c', 'copy', '-movflags', 'faststart', part]
+        subprocess.check_call(cmd)
 
 
 def main():
